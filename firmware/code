@@ -1,0 +1,2063 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <Preferences.h>
+#include <DHT.h>
+#include <HardwareSerial.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include <WiFi.h>
+#include <FirebaseESP32.h>
+
+// ----------------- WiFi & Firebase Config -----------------
+const char* ssid = "TMD.A50s";
+const char* password = "11225533";
+
+#define FIREBASE_HOST "hethongkho-39e4f-default-rtdb.asia-southeast1.firebasedatabase.app"
+#define FIREBASE_AUTH "Vr8bpbcukvXNktHZnn29pjSjGcYRa8BLcL.chmrN4"
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// ----------------- Hardware & config -----------------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 32
+#define OLED_RESET -1
+#define SCREEN_ADDRESS 0x3C
+#define OLED_SDA 21
+#define OLED_SCL 20
+
+// RFID Reader (shared)
+#define SS_PIN   13
+#define RST_PIN   9
+#define SCK_PIN  12
+#define MISO_PIN 10
+#define MOSI_PIN 11
+
+// Còi & LED (shared)
+#define BUZZER_PIN 8
+#define LED_PIN 46
+
+// Keypad Matrix 4x3 (shared)
+const byte ROWS = 4;
+const byte COLS = 3;
+char keysArr[ROWS][COLS] = {
+  {'1', '2', '3'},
+  {'4', '5', '6'},
+  {'7', '8', '9'},
+  {'*', '0', '#'}
+};
+byte rowPins[ROWS] = {4, 5, 6, 7};
+byte colPins[COLS] = {15, 16, 17};
+
+// Preferences - tách riêng cho mỗi kho
+Preferences pref1; // namespace "smart-lock1"
+Preferences pref2; // namespace "smart-lock2"
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+
+// SIM module (shared)
+HardwareSerial moduleSim(1);
+#define RX_PIN 38
+#define TX_PIN 37
+
+// Room 1
+const byte masterUID1[] = { 0x02, 0x71, 0x77, 0x06 };
+const byte MASTER_UID1_LEN = 4;
+#define RELAY_PIN_1 41        // Khóa cửa (lock1)
+#define PIR_PIN_1 2
+#define PIR_RELAY_PIN_1 40    // Đèn (light1) 
+#define DHT_PIN_1 42
+#define EMERGENCY_BUTTON_PIN_1 39
+String correctPassword1 = "123456";
+String ALLOWED_PHONE_1 = "+84377615747";
+
+// Room 2
+const byte masterUID2[] = { 0x47, 0x36, 0xCD, 0x95 };
+const byte MASTER_UID2_LEN = 4;
+#define RELAY_PIN_2 45        // Khóa cửa (lock2)
+#define PIR_PIN_2 36
+#define PIR_RELAY_PIN_2 48    // Đèn (light2)
+#define DHT_PIN_2 35
+#define EMERGENCY_BUTTON_PIN_2 47
+String correctPassword2 = "654321";
+String ALLOWED_PHONE_2 = "+84377615747";
+
+#define DHT_TYPE DHT22
+DHT dht1(DHT_PIN_1, DHT_TYPE);
+DHT dht2(DHT_PIN_2, DHT_TYPE);
+
+#define MAX_CHILD_CARDS 10
+byte childUIDs1[MAX_CHILD_CARDS][4];
+byte childUIDs2[MAX_CHILD_CARDS][4];
+int childCount1 = 0;
+int childCount2 = 0;
+
+int failedAttempts1 = 0;
+int failedAttempts2 = 0;
+bool childCardsLocked1 = false;
+bool childCardsLocked2 = false;
+unsigned long lockStartTime1 = 0;
+unsigned long lockStartTime2 = 0;
+
+const int MAX_FAILED_ATTEMPTS_WARNING = 5;
+const int MAX_FAILED_ATTEMPTS_LOCK = 10;
+unsigned long lastFailedSMSTime1 = 0;
+unsigned long lastFailedSMSTime2 = 0;
+
+const unsigned long MASTER_MODE_DURATION = 15000;
+const unsigned long OPERATION_DURATION = 10000;
+bool isMasterMode1 = false;
+bool isMasterMode2 = false;
+unsigned long masterModeStartTime1 = 0;
+unsigned long masterModeStartTime2 = 0;
+
+enum OperationMode { MODE_NORMAL, MODE_ADD_CARD, MODE_REMOVE_CARD, MODE_PASSWORD_INPUT };
+OperationMode currentMode1 = MODE_NORMAL;
+OperationMode currentMode2 = MODE_NORMAL;
+
+String inputPassword1 = "";
+String inputPassword2 = "";
+const int PASSWORD_LENGTH = 6;
+
+bool motionDetected1 = false;
+bool motionDetected2 = false;
+bool lastMotionState1 = false;
+bool lastMotionState2 = false;
+unsigned long lastMotionTime1 = 0;
+unsigned long lastMotionTime2 = 0;
+const unsigned long MOTION_TIMEOUT = 60000;
+unsigned long lastPIRRead1 = 0;
+unsigned long lastPIRRead2 = 0;
+const unsigned long PIR_READ_INTERVAL = 500;
+
+unsigned long lastDisplayUpdate = 0;
+const unsigned long DISPLAY_UPDATE_INTERVAL = 500;
+bool displayPriority = false;
+unsigned long priorityDisplayTime = 0;
+unsigned long priorityDisplayDuration = 10000;
+
+bool emergencyButtonState1 = false;
+bool lastEmergencyButtonState1 = true;
+unsigned long emergencyButtonPressTime1 = 0;
+bool emergencyButtonState2 = false;
+bool lastEmergencyButtonState2 = true;
+unsigned long emergencyButtonPressTime2 = 0;
+const unsigned long EMERGENCY_HOLD_DURATION = 3000;
+
+unsigned long lastSensorRead = 0;
+const unsigned long SENSOR_INTERVAL = 5000;
+unsigned long lastSMSCheck = 0;
+const unsigned long SMS_CHECK_INTERVAL = 1000;
+
+int activeRoom = 0;
+
+unsigned long lastKeyPressTime = 0;
+const unsigned long KEY_DEBOUNCE_TIME = 50;
+
+bool alarmActive1 = false;
+bool alarmActive2 = false;
+
+// For relay auto-off timing (non-blocking)
+unsigned long relayOnUntil1 = 0;        // Khóa cửa P1
+unsigned long relayOnUntil2 = 0;        // Khóa cửa P2
+unsigned long lightOnUntil1 = 0;        // Đèn P1
+unsigned long lightOnUntil2 = 0;        // Đèn P2
+
+// Biến lưu trạng thái cũ từ Firebase
+bool lastLock1State = false;
+bool lastLock2State = false;
+bool lastLight1State = false;
+bool lastLight2State = false;
+bool lastAuto1State = true;  // Mặc định auto = true
+bool lastAuto2State = true;  // Mặc định auto = true
+
+// -------------------- BIẾN NGƯỠNG CẢNH BÁO (2 LOW, 2 HIGH) --------------------
+// Room 1
+float lowTemp1 = 15.0;      // NGƯỠNG THẤP NHIỆT ĐỘ (dưới 15°C -> cảnh báo)
+float highTemp1 = 35.0;     // NGƯỠNG CAO NHIỆT ĐỘ (trên 35°C -> cảnh báo)
+float lowHum1 = 40.0;       // NGƯỠNG THẤP ĐỘ ẨM (dưới 40% -> cảnh báo)  
+float highHum1 = 70.0;      // NGƯỠNG CAO ĐỘ ẨM (trên 70% -> cảnh báo)
+
+// Room 2
+float lowTemp2 = 15.0;
+float highTemp2 = 35.0;
+float lowHum2 = 40.0;
+float highHum2 = 70.0;
+
+// ============= BIẾN CACHE DHT =============
+float cachedTemp1 = 25.0, cachedHum1 = 50.0;
+float cachedTemp2 = 25.0, cachedHum2 = 50.0;
+bool dhtCacheValid1 = false;
+bool dhtCacheValid2 = false;
+// ==========================================
+
+// -------------------- FreeRTOS primitives --------------------
+typedef struct {
+  uint8_t uid[4];
+  uint8_t size;
+} RFIDMessage;
+
+QueueHandle_t queueRFID = NULL;
+QueueHandle_t queueKeypad = NULL;
+QueueHandle_t queueDisplay = NULL;
+SemaphoreHandle_t displayMutex = NULL;
+SemaphoreHandle_t prefsMutex = NULL;
+
+#define DISPLAY_POOL_SIZE 8
+#define DISPLAY_MSG_LEN 64
+char displayPool[DISPLAY_POOL_SIZE][DISPLAY_MSG_LEN];
+QueueHandle_t queueDisplayIndex = NULL;
+
+// -------------------- Function prototypes --------------------
+void TaskRFID(void *pvParameters);
+void TaskKeypad(void *pvParameters);
+void TaskSensors(void *pvParameters);
+void TaskSMS(void *pvParameters);
+void TaskDisplay(void *pvParameters);
+void TaskMainLogic(void *pvParameters);
+void TaskFirebase(void *pvParameters);
+
+void saveChildCardsToPreferences(int room);
+void loadChildCardsFromPreferences(int room);
+void saveFailedAttempts(int room);
+void resetFailedAttempts(int room);
+void deleteAllChildCards(int room);
+
+bool checkIfMaster(byte* uid, byte size, int room);
+bool checkIfChildInRoom(byte* uid, byte size, int room);
+int findChildCardRoom(byte* uid, byte size);
+
+bool sendSMS(String phone, String content);
+String readFromSIM(uint32_t timeout = 3000);
+bool waitForSIM(String expected, uint32_t timeout);
+
+void controlBuzzerAndLED(float temperature, float humidity, int room);
+String getSystemStatus(int room);
+
+void connectWiFi();
+void initFirebase();
+void updateFirebase(int room);
+void updateFirebaseSensorsOnly(int room);
+bool controlFromFirebase();
+void updateThresholdsFromFirebase();
+void resetSecurityOnFirebaseOpen(int room);
+void resetToAutoState(int room);
+void openLock(int room);
+void turnOnLight(int room);
+void turnOffLight(int room);
+void beepBuzzerShort();
+void beepWarning5s();
+int allocateDisplaySlot(const char* txt);
+void postDisplayMessage(const char* txt);
+
+// -------------------- WiFi & Firebase Functions --------------------
+void connectWiFi() {
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+  }
+}
+
+void initFirebase() {
+  config.database_url = FIREBASE_HOST;
+  config.signer.tokens.legacy_token = FIREBASE_AUTH;
+  
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+}
+
+void updateFirebase(int room) {
+  if (room == 1) {
+    // Dùng cache thay vì đọc trực tiếp
+    if (dhtCacheValid1) {
+      Firebase.setFloat(fbdo, "/kho1/hum1", cachedHum1);
+      Firebase.setFloat(fbdo, "/kho1/temp1", cachedTemp1);
+    }
+    
+    Firebase.setBool(fbdo, "/kho1/alarm1", alarmActive1);
+    Firebase.setBool(fbdo, "/kho1/auto1", lastAuto1State);
+    Firebase.setString(fbdo, "/kho1/childcard1", String(childCount1));
+    Firebase.setBool(fbdo, "/kho1/childlock1", childCardsLocked1);
+    Firebase.setInt(fbdo, "/kho1/fail1", failedAttempts1);
+    Firebase.setBool(fbdo, "/kho1/light1", digitalRead(PIR_RELAY_PIN_1) == HIGH);
+    Firebase.setBool(fbdo, "/kho1/lock1", digitalRead(RELAY_PIN_1) == HIGH);
+    Firebase.setBool(fbdo, "/kho1/pir1", motionDetected1);
+    
+  } else {
+    // Dùng cache thay vì đọc trực tiếp
+    if (dhtCacheValid2) {
+      Firebase.setFloat(fbdo, "/kho2/hum2", cachedHum2);
+      Firebase.setFloat(fbdo, "/kho2/temp2", cachedTemp2);
+    }
+    
+    Firebase.setBool(fbdo, "/kho2/alarm2", alarmActive2);
+    Firebase.setBool(fbdo, "/kho2/auto2", lastAuto2State);
+    Firebase.setString(fbdo, "/kho2/childcard2", String(childCount2));
+    Firebase.setBool(fbdo, "/kho2/childlock2", childCardsLocked2);
+    Firebase.setInt(fbdo, "/kho2/fail2", failedAttempts2);
+    Firebase.setBool(fbdo, "/kho2/light2", digitalRead(PIR_RELAY_PIN_2) == HIGH);
+    Firebase.setBool(fbdo, "/kho2/lock2", digitalRead(RELAY_PIN_2) == HIGH);
+    Firebase.setBool(fbdo, "/kho2/pir2", motionDetected2);
+  }
+}
+
+void updateFirebaseSensorsOnly(int room) {
+  if (room == 1) {
+    // Dùng cache
+    if (dhtCacheValid1) {
+      Firebase.setFloat(fbdo, "/kho1/hum1", cachedHum1);
+      Firebase.setFloat(fbdo, "/kho1/temp1", cachedTemp1);
+    }
+    
+    Firebase.setBool(fbdo, "/kho1/alarm1", alarmActive1);
+    Firebase.setString(fbdo, "/kho1/childcard1", String(childCount1));
+    Firebase.setBool(fbdo, "/kho1/childlock1", childCardsLocked1);
+    Firebase.setInt(fbdo, "/kho1/fail1", failedAttempts1);
+    Firebase.setBool(fbdo, "/kho1/pir1", motionDetected1);
+    
+  } else {
+    // Dùng cache
+    if (dhtCacheValid2) {
+      Firebase.setFloat(fbdo, "/kho2/hum2", cachedHum2);
+      Firebase.setFloat(fbdo, "/kho2/temp2", cachedTemp2);
+    }
+    
+    Firebase.setBool(fbdo, "/kho2/alarm2", alarmActive2);
+    Firebase.setString(fbdo, "/kho2/childcard2", String(childCount2));
+    Firebase.setBool(fbdo, "/kho2/childlock2", childCardsLocked2);
+    Firebase.setInt(fbdo, "/kho2/fail2", failedAttempts2);
+    Firebase.setBool(fbdo, "/kho2/pir2", motionDetected2);
+  }
+}
+
+// Hàm cập nhật ngưỡng cảnh báo và số điện thoại, mật khẩu từ Firebase
+void updateThresholdsFromFirebase() {
+  // Cập nhật ngưỡng nhiệt độ, độ ẩm - 4 NGƯỠNG (2 LOW, 2 HIGH)
+  if (Firebase.getFloat(fbdo, "/kho1/lowtemp1")) {
+    lowTemp1 = fbdo.floatData();
+  }
+  if (Firebase.getFloat(fbdo, "/kho1/hightemp1")) {
+    highTemp1 = fbdo.floatData();
+  }
+  if (Firebase.getFloat(fbdo, "/kho1/lowhum1")) {
+    lowHum1 = fbdo.floatData();
+  }
+  if (Firebase.getFloat(fbdo, "/kho1/highhum1")) {
+    highHum1 = fbdo.floatData();
+  }
+  
+  if (Firebase.getFloat(fbdo, "/kho2/lowtemp2")) {
+    lowTemp2 = fbdo.floatData();
+  }
+  if (Firebase.getFloat(fbdo, "/kho2/hightemp2")) {
+    highTemp2 = fbdo.floatData();
+  }
+  if (Firebase.getFloat(fbdo, "/kho2/lowhum2")) {
+    lowHum2 = fbdo.floatData();
+  }
+  if (Firebase.getFloat(fbdo, "/kho2/highhum2")) {
+    highHum2 = fbdo.floatData();
+  }
+
+  // Cập nhật số điện thoại
+  if (Firebase.getString(fbdo, "/kho1/phone1")) {
+    String newPhone1 = fbdo.stringData();
+    if (newPhone1.length() > 0 && newPhone1 != ALLOWED_PHONE_1) {
+      ALLOWED_PHONE_1 = newPhone1;
+      Serial.println("Updated phone1: " + ALLOWED_PHONE_1);
+    }
+  }
+  
+  if (Firebase.getString(fbdo, "/kho2/phone2")) {
+    String newPhone2 = fbdo.stringData();
+    if (newPhone2.length() > 0 && newPhone2 != ALLOWED_PHONE_2) {
+      ALLOWED_PHONE_2 = newPhone2;
+      Serial.println("Updated phone2: " + ALLOWED_PHONE_2);
+    }
+  }
+
+  // CẬP NHẬT MẬT KHẨU
+  if (Firebase.getString(fbdo, "/kho1/pass1")) {
+    String newPass1 = fbdo.stringData();
+    if (newPass1.length() == 6 && newPass1 != correctPassword1) {
+      correctPassword1 = newPass1;
+      Serial.println("Updated password1: " + correctPassword1);
+    } else if (newPass1.length() != 6) {
+      Firebase.setString(fbdo, "/kho1/pass1", correctPassword1);
+      Serial.println("Invalid password1 length, updated Firebase with current password");
+    }
+  }
+  
+  if (Firebase.getString(fbdo, "/kho2/pass2")) {
+    String newPass2 = fbdo.stringData();
+    if (newPass2.length() == 6 && newPass2 != correctPassword2) {
+      correctPassword2 = newPass2;
+      Serial.println("Updated password2: " + correctPassword2);
+    } else if (newPass2.length() != 6) {
+      Firebase.setString(fbdo, "/kho2/pass2", correctPassword2);
+      Serial.println("Invalid password2 length, updated Firebase with current password");
+    }
+  }
+}
+
+// Hàm reset bảo mật khi mở khóa bằng Firebase hoặc SMS
+void resetSecurityOnFirebaseOpen(int room) {
+  if (room == 1) {
+    if (failedAttempts1 > 0 || childCardsLocked1) {
+      resetFailedAttempts(1);
+    }
+  } else {
+    if (failedAttempts2 > 0 || childCardsLocked2) {
+      resetFailedAttempts(2);
+    }
+  }
+}
+
+// Hàm reset về trạng thái auto mode bình thường
+void resetToAutoState(int room) {
+  if (room == 1) {
+    if (digitalRead(RELAY_PIN_1) == HIGH) {
+      digitalWrite(RELAY_PIN_1, LOW);
+      relayOnUntil1 = 0;
+    }
+    
+    if (digitalRead(PIR_RELAY_PIN_1) == HIGH && lightOnUntil1 == 0) {
+      digitalWrite(PIR_RELAY_PIN_1, LOW);
+    }
+    
+    lightOnUntil1 = 0;
+    motionDetected1 = false;
+    
+    Firebase.setBool(fbdo, "/kho1/lock1", false);
+    Firebase.setBool(fbdo, "/kho1/light1", false);
+    
+  } else {
+    if (digitalRead(RELAY_PIN_2) == HIGH) {
+      digitalWrite(RELAY_PIN_2, LOW);
+      relayOnUntil2 = 0;
+    }
+    
+    if (digitalRead(PIR_RELAY_PIN_2) == HIGH && lightOnUntil2 == 0) {
+      digitalWrite(PIR_RELAY_PIN_2, LOW);
+    }
+    
+    lightOnUntil2 = 0;
+    motionDetected2 = false;
+    
+    Firebase.setBool(fbdo, "/kho2/lock2", false);
+    Firebase.setBool(fbdo, "/kho2/light2", false);
+  }
+}
+
+// Hàm điều khiển từ Firebase xuống
+bool controlFromFirebase() {
+  bool newLock1, newLock2, newLight1, newLight2, newAuto1, newAuto2, newChildLock1, newChildLock2;
+  bool hasChange = false;
+  
+  // Đọc chế độ auto từ Firebase
+  if (Firebase.getBool(fbdo, "/kho1/auto1")) {
+    newAuto1 = fbdo.boolData();
+    if (newAuto1 != lastAuto1State) {
+      hasChange = true;
+      
+      if (lastAuto1State == false && newAuto1 == true) {
+        resetToAutoState(1);
+      }
+      
+      lastAuto1State = newAuto1;
+    }
+  }
+  
+  if (Firebase.getBool(fbdo, "/kho2/auto2")) {
+    newAuto2 = fbdo.boolData();
+    if (newAuto2 != lastAuto2State) {
+      hasChange = true;
+      
+      if (lastAuto2State == false && newAuto2 == true) {
+        resetToAutoState(2);
+      }
+      
+      lastAuto2State = newAuto2;
+    }
+  }
+  
+  // Điều khiển childlock từ Firebase
+  if (Firebase.getBool(fbdo, "/kho1/childlock1")) {
+    newChildLock1 = fbdo.boolData();
+    if (newChildLock1 != childCardsLocked1) {
+      hasChange = true;
+      if (!newChildLock1 && childCardsLocked1) {
+        // Mở khóa thẻ con và reset số lần sai
+        resetFailedAttempts(1);
+        postDisplayMessage("CHILDLOCK P1: OFF\nSystem reset");
+      } else if (newChildLock1 && !childCardsLocked1) {
+        // Kích hoạt khóa thẻ con
+        childCardsLocked1 = true;
+        alarmActive1 = true;
+        postDisplayMessage("CHILDLOCK P1: ON\nALARM ACTIVATED");
+      }
+      childCardsLocked1 = newChildLock1;
+    }
+  }
+  
+  if (Firebase.getBool(fbdo, "/kho2/childlock2")) {
+    newChildLock2 = fbdo.boolData();
+    if (newChildLock2 != childCardsLocked2) {
+      hasChange = true;
+      if (!newChildLock2 && childCardsLocked2) {
+        // Mở khóa thẻ con và reset số lần sai
+        resetFailedAttempts(2);
+        postDisplayMessage("CHILDLOCK P2: OFF\nSystem reset");
+      } else if (newChildLock2 && !childCardsLocked2) {
+        // Kích hoạt khóa thẻ con
+        childCardsLocked2 = true;
+        alarmActive2 = true;
+        postDisplayMessage("CHILDLOCK P2: ON\nALARM ACTIVATED");
+      }
+      childCardsLocked2 = newChildLock2;
+    }
+  }
+  
+  // Khi auto = false, chỉ nhận lệnh từ Firebase cho lock và light
+  if (!lastAuto1State) {
+    if (Firebase.getBool(fbdo, "/kho1/lock1")) {
+      newLock1 = fbdo.boolData();
+      if (newLock1 != lastLock1State) {
+        hasChange = true;
+        lastLock1State = newLock1;
+        if (newLock1 && digitalRead(RELAY_PIN_1) == LOW) {
+          resetSecurityOnFirebaseOpen(1);
+          openLock(1);
+        }
+      }
+    }
+    
+    if (Firebase.getBool(fbdo, "/kho1/light1")) {
+      newLight1 = fbdo.boolData();
+      if (newLight1 != lastLight1State) {
+        hasChange = true;
+        lastLight1State = newLight1;
+        if (newLight1 && digitalRead(PIR_RELAY_PIN_1) == LOW) {
+          turnOnLight(1);
+        } else if (!newLight1 && digitalRead(PIR_RELAY_PIN_1) == HIGH) {
+          turnOffLight(1);
+        }
+      }
+    }
+  }
+  
+  if (!lastAuto2State) {
+    if (Firebase.getBool(fbdo, "/kho2/lock2")) {
+      newLock2 = fbdo.boolData();
+      if (newLock2 != lastLock2State) {
+        hasChange = true;
+        lastLock2State = newLock2;
+        if (newLock2 && digitalRead(RELAY_PIN_2) == LOW) {
+          resetSecurityOnFirebaseOpen(2);
+          openLock(2);
+        }
+      }
+    }
+    
+    if (Firebase.getBool(fbdo, "/kho2/light2")) {
+      newLight2 = fbdo.boolData();
+      if (newLight2 != lastLight2State) {
+        hasChange = true;
+        lastLight2State = newLight2;
+        if (newLight2 && digitalRead(PIR_RELAY_PIN_2) == LOW) {
+          turnOnLight(2);
+        } else if (!newLight2 && digitalRead(PIR_RELAY_PIN_2) == HIGH) {
+          turnOffLight(2);
+        }
+      }
+    }
+  }
+  
+  // Khi auto = true, vẫn cho phép điều khiển từ Firebase
+  if (lastAuto1State) {
+    if (Firebase.getBool(fbdo, "/kho1/lock1")) {
+      newLock1 = fbdo.boolData();
+      if (newLock1 != lastLock1State) {
+        hasChange = true;
+        lastLock1State = newLock1;
+        if (newLock1 && digitalRead(RELAY_PIN_1) == LOW) {
+          resetSecurityOnFirebaseOpen(1);
+          openLock(1);
+        }
+      }
+    }
+    
+    if (Firebase.getBool(fbdo, "/kho1/light1")) {
+      newLight1 = fbdo.boolData();
+      if (newLight1 != lastLight1State) {
+        hasChange = true;
+        lastLight1State = newLight1;
+        if (newLight1 && digitalRead(PIR_RELAY_PIN_1) == LOW) {
+          turnOnLight(1);
+        }
+      }
+    }
+  }
+  
+  if (lastAuto2State) {
+    if (Firebase.getBool(fbdo, "/kho2/lock2")) {
+      newLock2 = fbdo.boolData();
+      if (newLock2 != lastLock2State) {
+        hasChange = true;
+        lastLock2State = newLock2;
+        if (newLock2 && digitalRead(RELAY_PIN_2) == LOW) {
+          resetSecurityOnFirebaseOpen(2);
+          openLock(2);
+        }
+      }
+    }
+    
+    if (Firebase.getBool(fbdo, "/kho2/light2")) {
+      newLight2 = fbdo.boolData();
+      if (newLight2 != lastLight2State) {
+        hasChange = true;
+        lastLight2State = newLight2;
+        if (newLight2 && digitalRead(PIR_RELAY_PIN_2) == LOW) {
+          turnOnLight(2);
+        }
+      }
+    }
+  }
+  
+  return hasChange;
+}
+
+// Hàm mở khóa (luôn tự đóng sau 5s)
+void openLock(int room) {
+  unsigned long now = millis();
+  if (room == 1) {
+    digitalWrite(RELAY_PIN_1, HIGH);
+    relayOnUntil1 = now + 5000;
+    Firebase.setBool(fbdo, "/kho1/lock1", true);
+    beepBuzzerShort();
+  } else {
+    digitalWrite(RELAY_PIN_2, HIGH);
+    relayOnUntil2 = now + 5000;
+    Firebase.setBool(fbdo, "/kho2/lock2", true);
+    beepBuzzerShort();
+  }
+}
+
+// Hàm bật đèn
+void turnOnLight(int room) {
+  unsigned long now = millis();
+  if (room == 1) {
+    digitalWrite(PIR_RELAY_PIN_1, HIGH);
+    if (lastAuto1State) {
+      lightOnUntil1 = now + MOTION_TIMEOUT;
+    } else {
+      lightOnUntil1 = 0;
+    }
+    Firebase.setBool(fbdo, "/kho1/light1", true);
+  } else {
+    digitalWrite(PIR_RELAY_PIN_2, HIGH);
+    if (lastAuto2State) {
+      lightOnUntil2 = now + MOTION_TIMEOUT;
+    } else {
+      lightOnUntil2 = 0;
+    }
+    Firebase.setBool(fbdo, "/kho2/light2", true);
+  }
+}
+
+// Hàm tắt đèn
+void turnOffLight(int room) {
+  if (room == 1) {
+    digitalWrite(PIR_RELAY_PIN_1, LOW);
+    lightOnUntil1 = 0;
+    motionDetected1 = false;
+    Firebase.setBool(fbdo, "/kho1/light1", false);
+  } else {
+    digitalWrite(PIR_RELAY_PIN_2, LOW);
+    lightOnUntil2 = 0;
+    motionDetected2 = false;
+    Firebase.setBool(fbdo, "/kho2/light2", false);
+  }
+}
+
+// -------------------- Preferences helpers --------------------
+void saveChildCardsToPreferences(int room) {
+  if (xSemaphoreTake(prefsMutex, portMAX_DELAY) == pdTRUE) {
+    if (room == 1) {
+      pref1.putInt("childCount", childCount1);
+      for (int i = 0; i < childCount1; i++) {
+        String key = "child" + String(i);
+        pref1.putBytes(key.c_str(), childUIDs1[i], 4);
+      }
+    } else {
+      pref2.putInt("childCount", childCount2);
+      for (int i = 0; i < childCount2; i++) {
+        String key = "child" + String(i);
+        pref2.putBytes(key.c_str(), childUIDs2[i], 4);
+      }
+    }
+    xSemaphoreGive(prefsMutex);
+  }
+}
+
+void loadChildCardsFromPreferences(int room) {
+  if (xSemaphoreTake(prefsMutex, portMAX_DELAY) == pdTRUE) {
+    if (room == 1) {
+      childCount1 = pref1.getInt("childCount", 0);
+      if (childCount1 > MAX_CHILD_CARDS) childCount1 = 0;
+      for (int i = 0; i < childCount1; i++) {
+        String key = "child" + String(i);
+        size_t br = pref1.getBytes(key.c_str(), childUIDs1[i], 4);
+        if (br != 4) { childCount1 = i; break; }
+      }
+    } else {
+      childCount2 = pref2.getInt("childCount", 0);
+      if (childCount2 > MAX_CHILD_CARDS) childCount2 = 0;
+      for (int i = 0; i < childCount2; i++) {
+        String key = "child" + String(i);
+        size_t br = pref2.getBytes(key.c_str(), childUIDs2[i], 4);
+        if (br != 4) { childCount2 = i; break; }
+      }
+    }
+    xSemaphoreGive(prefsMutex);
+  }
+}
+
+void saveFailedAttempts(int room) {
+  if (xSemaphoreTake(prefsMutex, portMAX_DELAY) == pdTRUE) {
+    if (room == 1) {
+      pref1.putInt("failedAttempts", failedAttempts1);
+    } else {
+      pref2.putInt("failedAttempts", failedAttempts2);
+    }
+    xSemaphoreGive(prefsMutex);
+  }
+}
+
+void resetFailedAttempts(int room) {
+  if (room == 1) {
+    if (failedAttempts1 != 0 || childCardsLocked1) {
+      failedAttempts1 = 0;
+      childCardsLocked1 = false;
+      alarmActive1 = false;
+      saveFailedAttempts(1);
+      // Cập nhật Firebase
+      Firebase.setBool(fbdo, "/kho1/childlock1", false);
+      Firebase.setBool(fbdo, "/kho1/alarm1", false);
+      Firebase.setInt(fbdo, "/kho1/fail1", 0);
+      
+      if (childCount1 == 0) {
+        loadChildCardsFromPreferences(1);
+      }
+    } else childCardsLocked1 = false;
+    noTone(BUZZER_PIN);
+    digitalWrite(LED_PIN, LOW);
+  } else {
+    if (failedAttempts2 != 0 || childCardsLocked2) {
+      failedAttempts2 = 0;
+      childCardsLocked2 = false;
+      alarmActive2 = false;
+      saveFailedAttempts(2);
+      // Cập nhật Firebase
+      Firebase.setBool(fbdo, "/kho2/childlock2", false);
+      Firebase.setBool(fbdo, "/kho2/alarm2", false);
+      Firebase.setInt(fbdo, "/kho2/fail2", 0);
+      
+      if (childCount2 == 0) {
+        loadChildCardsFromPreferences(2);
+      }
+    } else childCardsLocked2 = false;
+    noTone(BUZZER_PIN);
+    digitalWrite(LED_PIN, LOW);
+  }
+}
+
+void deleteAllChildCards(int room) {
+  if (xSemaphoreTake(prefsMutex, portMAX_DELAY) == pdTRUE) {
+    if (room == 1) {
+      childCount1 = 0;
+      pref1.putInt("childCount", 0);
+      for (int i = 0; i < MAX_CHILD_CARDS; i++) {
+        String key = "child" + String(i);
+        if (pref1.isKey(key.c_str())) pref1.remove(key.c_str());
+      }
+    } else {
+      childCount2 = 0;
+      pref2.putInt("childCount", 0);
+      for (int i = 0; i < MAX_CHILD_CARDS; i++) {
+        String key = "child" + String(i);
+        if (pref2.isKey(key.c_str())) pref2.remove(key.c_str());
+      }
+    }
+    xSemaphoreGive(prefsMutex);
+  }
+}
+
+// -------------------- Helper checks --------------------
+bool checkIfMaster(byte* uid, byte size, int room) {
+  if (room == 1) {
+    if (size != MASTER_UID1_LEN) return false;
+    for (byte i = 0; i < MASTER_UID1_LEN; i++) if (uid[i] != masterUID1[i]) return false;
+    return true;
+  } else {
+    if (size != MASTER_UID2_LEN) return false;
+    for (byte i = 0; i < MASTER_UID2_LEN; i++) if (uid[i] != masterUID2[i]) return false;
+    return true;
+  }
+}
+
+bool checkIfChildInRoom(byte* uid, byte size, int room) {
+  if (size != 4) return false;
+  if (room == 1) {
+    for (int i = 0; i < childCount1; i++) {
+      bool match = true;
+      for (byte j = 0; j < 4; j++) if (uid[j] != childUIDs1[i][j]) { match = false; break; }
+      if (match) return true;
+    }
+  } else {
+    for (int i = 0; i < childCount2; i++) {
+      bool match = true;
+      for (byte j = 0; j < 4; j++) if (uid[j] != childUIDs2[i][j]) { match = false; break; }
+      if (match) return true;
+    }
+  }
+  return false;
+}
+
+int findChildCardRoom(byte* uid, byte size) {
+  if (size != 4) return 0;
+  for (int i = 0; i < childCount1; i++) {
+    bool match = true;
+    for (byte j = 0; j < 4; j++) if (uid[j] != childUIDs1[i][j]) { match = false; break; }
+    if (match) return 1;
+  }
+  for (int i = 0; i < childCount2; i++) {
+    bool match = true;
+    for (byte j = 0; j < 4; j++) if (uid[j] != childUIDs2[i][j]) { match = false; break; }
+    if (match) return 2;
+  }
+  return 0;
+}
+
+// -------------------- SIM functions --------------------
+String readFromSIM(uint32_t timeout) {
+  String data = "";
+  unsigned long start = millis();
+  while (millis() - start < timeout) {
+    while (moduleSim.available()) {
+      data += moduleSim.readString();
+      delay(2);
+    }
+    if (data.indexOf("+CMT:") >= 0 && data.indexOf("\n\n") >= 0) break;
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+  return data;
+}
+
+bool waitForSIM(String expected, uint32_t timeout) {
+  unsigned long start = millis();
+  String response = "";
+  while (millis() - start < timeout) {
+    while (moduleSim.available()) {
+      response += moduleSim.readString();
+      delay(2);
+    }
+    if (response.indexOf(expected) >= 0) return true;
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+  return false;
+}
+
+bool sendSMS(String phone, String content) {
+  moduleSim.println("AT+CMGF=1");
+  if (!waitForSIM("OK", 1000)) return false;
+  moduleSim.print("AT+CMGS=\"");
+  moduleSim.print(phone);
+  moduleSim.println("\"");
+  if (!waitForSIM(">", 3000)) return false;
+  moduleSim.print(content);
+  moduleSim.write(26);
+  return (waitForSIM("OK", 10000) || waitForSIM("+CMGS", 5000));
+}
+
+// -------------------- HÀM GET SYSTEM STATUS --------------------
+String getSystemStatus(int room) {
+  float h = 0, t = 0;
+  String msg = "";
+  
+  if (room == 1) {
+    // Dùng cache
+    if (dhtCacheValid1) {
+      h = cachedHum1; 
+      t = cachedTemp1;
+      msg += "Temp: " + String(t,1) + "C\n";
+      msg += "Hum: " + String(h,1) + "%\n";
+    } else {
+      msg += "Temp: --- C\n";
+      msg += "Hum: --- %\n";
+    }
+    
+    msg += "PIR: " + String(motionDetected1 ? "DETECTED" : "NO MOTION") + "\n";
+    msg += "Lock: " + String(digitalRead(RELAY_PIN_1) == HIGH ? "OPEN" : "CLOSED") + "\n";
+    msg += "Light: " + String(digitalRead(PIR_RELAY_PIN_1) == HIGH ? "ON" : "OFF") + "\n";
+    msg += "Mode: " + String(lastAuto1State ? "AUTO" : "MANUAL") + "\n";
+    msg += "ChildLock: " + String(childCardsLocked1 ? "ACTIVE" : "INACTIVE") + "\n";
+    msg += "Failed: " + String(failedAttempts1) + " times\n";
+    
+    // Trạng thái tổng hợp
+    if (childCardsLocked1) {
+      msg += "STATUS: SYSTEM LOCKED";
+    } else if (failedAttempts1 > 0) {
+      msg += "STATUS: WARNING ACTIVE";
+    } else {
+      msg += "STATUS: SYSTEM NORMAL";
+    }
+    
+  } else {
+    // Dùng cache
+    if (dhtCacheValid2) {
+      h = cachedHum2; 
+      t = cachedTemp2;
+      msg += "Temp: " + String(t,1) + "C\n";
+      msg += "Hum: " + String(h,1) + "%\n";
+    } else {
+      msg += "Temp: --- C\n";
+      msg += "Hum: --- %\n";
+    }
+    
+    msg += "PIR: " + String(motionDetected2 ? "DETECTED" : "NO MOTION") + "\n";
+    msg += "Lock: " + String(digitalRead(RELAY_PIN_2) == HIGH ? "OPEN" : "CLOSED") + "\n";
+    msg += "Light: " + String(digitalRead(PIR_RELAY_PIN_2) == HIGH ? "ON" : "OFF") + "\n";
+    msg += "Mode: " + String(lastAuto2State ? "AUTO" : "MANUAL") + "\n";
+    msg += "ChildLock: " + String(childCardsLocked2 ? "ACTIVE" : "INACTIVE") + "\n";
+    msg += "Failed: " + String(failedAttempts2) + " times\n";
+    
+    // Trạng thái tổng hợp
+    if (childCardsLocked2) {
+      msg += "STATUS: SYSTEM LOCKED";
+    } else if (failedAttempts2 > 0) {
+      msg += "STATUS: WARNING ACTIVE";
+    } else {
+      msg += "STATUS: SYSTEM NORMAL";
+    }
+  }
+  
+  return msg;
+}
+
+// -------------------- HÀM CONTROL BUZZER & LED (NHẤP NHÁY 200ms) --------------------
+void controlBuzzerAndLED(float temperature, float humidity, int room) {
+  // CHỈ CHECK NAN, KHÔNG CHECK == 0
+  if (isnan(temperature) || isnan(humidity)) {
+    return; // Bỏ qua nếu giá trị không hợp lệ
+  }
+  
+  static unsigned long lastBlinkTime1 = 0;
+  static unsigned long lastBlinkTime2 = 0;
+  static bool blinkState1 = false;
+  static bool blinkState2 = false;
+  static bool wasWarning1 = false;
+  static bool wasWarning2 = false;
+  unsigned long currentMillis = millis();
+
+  // Nếu đang báo động ChildLock, ưu tiên cảnh báo đó (liên tục)
+  if (room == 1 && alarmActive1) {
+    digitalWrite(LED_PIN, HIGH);
+    tone(BUZZER_PIN, 1200);
+    return;
+  }
+  if (room == 2 && alarmActive2) {
+    digitalWrite(LED_PIN, HIGH);
+    tone(BUZZER_PIN, 1200);
+    return;
+  }
+
+  if (room == 1) {
+    // KIỂM TRA CÓ VƯỢT NGƯỠNG KHÔNG (LOW hoặc HIGH)
+    bool isOutOfRange = (temperature <= lowTemp1 || temperature >= highTemp1 || 
+                         humidity <= lowHum1 || humidity >= highHum1);
+    
+    if (isOutOfRange) {
+      wasWarning1 = true;
+      
+      // NHẤP NHÁY 200ms (bật 100ms, tắt 100ms)
+      if (currentMillis - lastBlinkTime1 >= 100) {
+        lastBlinkTime1 = currentMillis;
+        blinkState1 = !blinkState1;
+        
+        if (blinkState1) {
+          digitalWrite(LED_PIN, HIGH);
+          tone(BUZZER_PIN, 1000);
+        } else {
+          digitalWrite(LED_PIN, LOW);
+          noTone(BUZZER_PIN);
+        }
+      }
+    } else {
+      if (wasWarning1) {
+        // TẮT CẢNH BÁO KHI TRỞ LẠI BÌNH THƯỜNG
+        digitalWrite(LED_PIN, LOW);
+        noTone(BUZZER_PIN);
+        wasWarning1 = false;
+        blinkState1 = false;
+      }
+    }
+  } 
+  else { // Room 2
+    bool isOutOfRange = (temperature <= lowTemp2 || temperature >= highTemp2 || 
+                         humidity <= lowHum2 || humidity >= highHum2);
+    
+    if (isOutOfRange) {
+      wasWarning2 = true;
+      
+      // NHẤP NHÁY 200ms (bật 100ms, tắt 100ms)
+      if (currentMillis - lastBlinkTime2 >= 100) {
+        lastBlinkTime2 = currentMillis;
+        blinkState2 = !blinkState2;
+        
+        if (blinkState2) {
+          digitalWrite(LED_PIN, HIGH);
+          tone(BUZZER_PIN, 1000);
+        } else {
+          digitalWrite(LED_PIN, LOW);
+          noTone(BUZZER_PIN);
+        }
+      }
+    } else {
+      if (wasWarning2) {
+        digitalWrite(LED_PIN, LOW);
+        noTone(BUZZER_PIN);
+        wasWarning2 = false;
+        blinkState2 = false;
+      }
+    }
+  }
+}
+
+// -------------------- Buzzer helper --------------------
+void beepBuzzerShort() {
+  tone(BUZZER_PIN, 1000, 80);
+}
+
+void beepWarning5s() {
+  tone(BUZZER_PIN, 1000);
+  unsigned long buzzerStart = millis();
+  while (millis() - buzzerStart < 5000) {
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+  noTone(BUZZER_PIN);
+}
+
+// -------------------- Display queue helper --------------------
+int allocateDisplaySlot(const char* txt) {
+  for (int i=0;i<DISPLAY_POOL_SIZE;i++) {
+    if (displayPool[i][0] == 0) {
+      strncpy(displayPool[i], txt, DISPLAY_MSG_LEN-1);
+      displayPool[i][DISPLAY_MSG_LEN-1] = 0;
+      return i;
+    }
+  }
+  strncpy(displayPool[0], txt, DISPLAY_MSG_LEN-1);
+  displayPool[0][DISPLAY_MSG_LEN-1] = 0;
+  return 0;
+}
+
+void postDisplayMessage(const char* txt) {
+  int idx = allocateDisplaySlot(txt);
+  xQueueSend(queueDisplayIndex, &idx, 0);
+}
+
+// -------------------- Tasks --------------------
+void TaskRFID(void *pvParameters) {
+  RFIDMessage msg;
+  for (;;) {
+    if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+      if (mfrc522.uid.size >= 4) {
+        memcpy(msg.uid, mfrc522.uid.uidByte, 4);
+        msg.size = 4;
+        xQueueSend(queueRFID, &msg, 0);
+      }
+      mfrc522.PICC_HaltA();
+      mfrc522.PCD_StopCrypto1();
+    }
+    vTaskDelay(pdMS_TO_TICKS(120));
+  }
+}
+
+char getKey_raw() {
+  char key = 0;
+  for (byte c = 0; c < COLS; c++) {
+    digitalWrite(colPins[c], LOW);
+    for (byte r = 0; r < ROWS; r++) {
+      if (digitalRead(rowPins[r]) == LOW) {
+        delay(5);
+        if (digitalRead(rowPins[r]) == LOW) {
+          key = keysArr[r][c];
+          unsigned long waitStart = millis();
+          while (digitalRead(rowPins[r]) == LOW) {
+            if (millis() - waitStart > 200) break;
+            vTaskDelay(pdMS_TO_TICKS(1));
+          }
+          break;
+        }
+      }
+    }
+    digitalWrite(colPins[c], HIGH);
+    if (key != 0) break;
+  }
+  return key;
+}
+
+
+void TaskKeypad(void *pvParameters) {
+  char key;
+  for (;;) {
+    key = getKey_raw();
+    if (key != 0) {
+      xQueueSend(queueKeypad, &key, 0);
+      vTaskDelay(pdMS_TO_TICKS(KEY_DEBOUNCE_TIME));
+    }
+    vTaskDelay(pdMS_TO_TICKS(200));
+  }
+}
+
+void TaskSensors(void *pvParameters) {
+  unsigned long lastPIR1 = 0, lastPIR2 = 0;
+  
+  for (;;) {
+    unsigned long now = millis();
+    
+    if (now - lastPIRRead1 >= PIR_READ_INTERVAL) {
+      lastPIRRead1 = now;
+      bool currentMotion = digitalRead(PIR_PIN_1);
+      
+      if (lastAuto1State && currentMotion && !lastMotionState1 && lightOnUntil1 == 0) {
+        motionDetected1 = true; 
+        lastMotionTime1 = now;
+        
+        digitalWrite(PIR_RELAY_PIN_1, HIGH);
+        lightOnUntil1 = now + MOTION_TIMEOUT;
+      }
+      lastMotionState1 = currentMotion;
+    }
+    
+    if (now - lastPIRRead2 >= PIR_READ_INTERVAL) {
+      lastPIRRead2 = now;
+      bool currentMotion = digitalRead(PIR_PIN_2);
+      
+      if (lastAuto2State && currentMotion && !lastMotionState2 && lightOnUntil2 == 0) {
+        motionDetected2 = true; 
+        lastMotionTime2 = now;
+        
+        digitalWrite(PIR_RELAY_PIN_2, HIGH);
+        lightOnUntil2 = now + MOTION_TIMEOUT;
+      }
+      lastMotionState2 = currentMotion;
+    }
+
+    if (lastAuto1State && lightOnUntil1 > 0 && now >= lightOnUntil1 && lightOnUntil1 != 0) {
+      digitalWrite(PIR_RELAY_PIN_1, LOW);
+      lightOnUntil1 = 0;
+      motionDetected1 = false;
+    }
+    if (lastAuto2State && lightOnUntil2 > 0 && now >= lightOnUntil2 && lightOnUntil2 != 0) {
+      digitalWrite(PIR_RELAY_PIN_2, LOW);
+      lightOnUntil2 = 0;
+      motionDetected2 = false;
+    }
+
+    bool eb1 = digitalRead(EMERGENCY_BUTTON_PIN_1);
+    if (eb1 == LOW && lastEmergencyButtonState1 == HIGH) {
+      emergencyButtonPressTime1 = now;
+      postDisplayMessage("EMERGENCY P1\nHold 3s to open...");
+    }
+    if (eb1 == LOW) {
+      unsigned long holdTime = now - emergencyButtonPressTime1;
+      if (holdTime >= EMERGENCY_HOLD_DURATION) {
+        postDisplayMessage("EMERGENCY OPEN P1");
+        resetFailedAttempts(1);
+        openLock(1);
+        for (int i=0;i<3;i++){ tone(BUZZER_PIN, 1000, 300); vTaskDelay(pdMS_TO_TICKS(350)); }
+      }
+    }
+    if (eb1 == HIGH && lastEmergencyButtonState1 == LOW) {
+      postDisplayMessage("EMERGENCY P1\nReleased");
+    }
+    lastEmergencyButtonState1 = eb1;
+
+    bool eb2 = digitalRead(EMERGENCY_BUTTON_PIN_2);
+    if (eb2 == LOW && lastEmergencyButtonState2 == HIGH) {
+      emergencyButtonPressTime2 = now;
+      postDisplayMessage("EMERGENCY P2\nHold 3s to open...");
+    }
+    if (eb2 == LOW) {
+      unsigned long holdTime = now - emergencyButtonPressTime2;
+      if (holdTime >= EMERGENCY_HOLD_DURATION) {
+        postDisplayMessage("EMERGENCY OPEN P2");
+        resetFailedAttempts(2);
+        openLock(2);
+        for (int i=0;i<3;i++){ tone(BUZZER_PIN, 1000, 300); vTaskDelay(pdMS_TO_TICKS(350)); }
+      }
+    }
+    if (eb2 == HIGH && lastEmergencyButtonState2 == LOW) {
+      postDisplayMessage("EMERGENCY P2\nReleased");
+    }
+    lastEmergencyButtonState2 = eb2;
+
+    // ============== ĐỌC DHT MỖI 5 GIÂY ==============
+    if (now - lastSensorRead >= SENSOR_INTERVAL) {
+      lastSensorRead = now;
+      
+      // Đọc DHT1
+      float t1 = dht1.readTemperature();
+      float h1 = dht1.readHumidity();
+      
+      delay(50);  // QUAN TRỌNG: delay giữa 2 cảm biến
+      
+      // Đọc DHT2  
+      float t2 = dht2.readTemperature();
+      float h2 = dht2.readHumidity();
+      
+      // Lưu vào cache nếu giá trị hợp lệ (CHỈ CHECK NAN)
+      if (!isnan(t1) && !isnan(h1)) {
+        cachedTemp1 = t1;
+        cachedHum1 = h1;
+        dhtCacheValid1 = true;
+      }
+      
+      if (!isnan(t2) && !isnan(h2)) {
+        cachedTemp2 = t2;
+        cachedHum2 = h2;
+        dhtCacheValid2 = true;
+      }
+      
+      // Dùng cache để kiểm tra cảnh báo
+      if (dhtCacheValid1) {
+        controlBuzzerAndLED(cachedTemp1, cachedHum1, 1);
+      }
+      if (dhtCacheValid2) {
+        controlBuzzerAndLED(cachedTemp2, cachedHum2, 2);
+      }
+    }
+    // ==============================================
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+void TaskSMS(void *pvParameters) {
+  for (;;) {
+    unsigned long now = millis();
+    if (now - lastSMSCheck >= SMS_CHECK_INTERVAL) {
+      lastSMSCheck = now;
+      String data = readFromSIM(1500);
+      if (data.indexOf("+CMT:") >= 0) {
+        int start = data.indexOf("\"") + 1;
+        int end = data.indexOf("\"", start);
+        String sender = data.substring(start, end);
+        int msgStart = data.indexOf("\n", end) + 1;
+        String message = data.substring(msgStart);
+        message.trim();
+        message.toLowerCase();
+        
+        if (message == "kiemtra") {
+          if (sender == ALLOWED_PHONE_1) sendSMS(ALLOWED_PHONE_1, "ok");
+          else if (sender == ALLOWED_PHONE_2) sendSMS(ALLOWED_PHONE_2, "ok");
+        } else if (message == "stat1") {
+          if (sender == ALLOWED_PHONE_1) sendSMS(ALLOWED_PHONE_1, getSystemStatus(1));
+        } else if (message == "stat2") {
+          if (sender == ALLOWED_PHONE_2) sendSMS(ALLOWED_PHONE_2, getSystemStatus(2));
+        } 
+        else if (message == "auto1on") {
+          if (sender == ALLOWED_PHONE_1) {
+            if (lastAuto1State == false) {
+              resetToAutoState(1);
+            }
+            lastAuto1State = true;
+            Firebase.setBool(fbdo, "/kho1/auto1", true);
+            sendSMS(ALLOWED_PHONE_1, "Auto mode P1: ON");
+          }
+        } else if (message == "auto1off") {
+          if (sender == ALLOWED_PHONE_1) {
+            lastAuto1State = false;
+            Firebase.setBool(fbdo, "/kho1/auto1", false);
+            sendSMS(ALLOWED_PHONE_1, "Auto mode P1: OFF");
+          }
+        } else if (message == "auto2on") {
+          if (sender == ALLOWED_PHONE_2) {
+            if (lastAuto2State == false) {
+              resetToAutoState(2);
+            }
+            lastAuto2State = true;
+            Firebase.setBool(fbdo, "/kho2/auto2", true);
+            sendSMS(ALLOWED_PHONE_2, "Auto mode P2: ON");
+          }
+        } else if (message == "auto2off") {
+          if (sender == ALLOWED_PHONE_2) {
+            lastAuto2State = false;
+            Firebase.setBool(fbdo, "/kho2/auto2", false);
+            sendSMS(ALLOWED_PHONE_2, "Auto mode P2: OFF");
+          }
+        }
+        else if (message == "lock1on") {
+          if (sender == ALLOWED_PHONE_1) {
+            resetSecurityOnFirebaseOpen(1);
+            openLock(1);
+            sendSMS(ALLOWED_PHONE_1, "Lock 1: OPENED via SMS\nAuto-close in 5s");
+          }
+        } 
+        else if (message == "lock2on") {
+          if (sender == ALLOWED_PHONE_2) {
+            resetSecurityOnFirebaseOpen(2);
+            openLock(2);
+            sendSMS(ALLOWED_PHONE_2, "Lock 2: OPENED via SMS\nAuto-close in 5s");
+          }
+        }
+        else if (message == "light1on") {
+          if (sender == ALLOWED_PHONE_1) {
+            turnOnLight(1);
+            sendSMS(ALLOWED_PHONE_1, "Light 1: TURNED ON via SMS");
+          }
+        } 
+        else if (message == "light1off") {
+          if (sender == ALLOWED_PHONE_1) {
+            turnOffLight(1);
+            sendSMS(ALLOWED_PHONE_1, "Light 1: TURNED OFF via SMS");
+          }
+        }
+        else if (message == "light2on") {
+          if (sender == ALLOWED_PHONE_2) {
+            turnOnLight(2);
+            sendSMS(ALLOWED_PHONE_2, "Light 2: TURNED ON via SMS");
+          }
+        } 
+        else if (message == "light2off") {
+          if (sender == ALLOWED_PHONE_2) {
+            turnOffLight(2);
+            sendSMS(ALLOWED_PHONE_2, "Light 2: TURNED OFF via SMS");
+          }
+        }
+        else if (message == "childlock1on") {
+          if (sender == ALLOWED_PHONE_1) {
+            childCardsLocked1 = true;
+            alarmActive1 = true;
+            Firebase.setBool(fbdo, "/kho1/childlock1", true);
+            Firebase.setBool(fbdo, "/kho1/alarm1", true);
+            sendSMS(ALLOWED_PHONE_1, "ChildLock P1: ACTIVATED");
+          }
+        }
+        else if (message == "childlock1off") {
+          if (sender == ALLOWED_PHONE_1) {
+            resetFailedAttempts(1);
+            sendSMS(ALLOWED_PHONE_1, "ChildLock P1: DEACTIVATED\nSystem reset");
+          }
+        }
+        else if (message == "childlock2on") {
+          if (sender == ALLOWED_PHONE_2) {
+            childCardsLocked2 = true;
+            alarmActive2 = true;
+            Firebase.setBool(fbdo, "/kho2/childlock2", true);
+            Firebase.setBool(fbdo, "/kho2/alarm2", true);
+            sendSMS(ALLOWED_PHONE_2, "ChildLock P2: ACTIVATED");
+          }
+        }
+        else if (message == "childlock2off") {
+          if (sender == ALLOWED_PHONE_2) {
+            resetFailedAttempts(2);
+            sendSMS(ALLOWED_PHONE_2, "ChildLock P2: DEACTIVATED\nSystem reset");
+          }
+        }
+        
+        moduleSim.println("AT+CMGD=1,4");
+        vTaskDelay(pdMS_TO_TICKS(100));
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(200));
+  }
+}
+
+void TaskDisplay(void *pvParameters) {
+  int idx;
+  unsigned long lastBaseScreen = 0;
+
+  for (;;) {
+    if (xQueueReceive(queueDisplayIndex, &idx, 0) == pdPASS) {
+      if (xSemaphoreTake(displayMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setTextColor(SSD1306_WHITE);
+        display.setCursor(0,0);
+
+        char* txt = displayPool[idx];
+        int line = 0;
+        char *p = strtok(txt, "\n");
+        while (p != NULL && line < 4) {
+          display.setCursor(0, line * 8);
+          display.println(p);
+          p = strtok(NULL, "\n");
+          line++;
+        }
+
+        display.display();
+        displayPool[idx][0] = 0;
+        xSemaphoreGive(displayMutex);
+
+        displayPriority = true;
+        priorityDisplayTime = millis();
+      }
+    }
+
+    if (millis() - lastBaseScreen > 2000 && !displayPriority) {
+      if (xSemaphoreTake(displayMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setTextColor(SSD1306_WHITE);
+        display.setCursor(0,0);
+        display.println("-- KHO THONG MINH --");
+        
+        // Dùng cache thay vì đọc trực tiếp
+        float temp1 = dhtCacheValid1 ? cachedTemp1 : 0;
+        float hum1 = dhtCacheValid1 ? cachedHum1 : 0;
+        float temp2 = dhtCacheValid2 ? cachedTemp2 : 0;
+        float hum2 = dhtCacheValid2 ? cachedHum2 : 0;
+        
+        display.printf("P1: %.1fC %.0f%% %s %s\n", temp1, hum1,
+                      motionDetected1 ? "ON" : "OFF", lastAuto1State ? "AU" : "MA");
+        display.printf("P2: %.1fC %.0f%% %s %s\n", temp2, hum2,
+                      motionDetected2 ? "ON" : "OFF", lastAuto2State ? "AU" : "MA");
+        display.display();
+        xSemaphoreGive(displayMutex);
+      }
+      lastBaseScreen = millis();
+    }
+
+    if (displayPriority && (millis() - priorityDisplayTime > priorityDisplayDuration)) {
+      priorityDisplayDuration = 10000;
+      displayPriority = false;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+// -------------------- Firebase Task --------------------
+void TaskFirebase(void *pvParameters) {
+  const unsigned long FIREBASE_READ_INTERVAL = 3000;
+  const unsigned long FIREBASE_WRITE_INTERVAL = 10000;
+  const unsigned long THRESHOLD_UPDATE_INTERVAL = 10000;
+  const unsigned long LOCK_LIGHT_UPDATE_INTERVAL = 10000;
+  
+  unsigned long lastRead = 0;
+  unsigned long lastWrite = 0;
+  unsigned long lastThresholdUpdate = 0;
+  unsigned long lastLockLightUpdate = 0;
+  
+  for (;;) {
+    unsigned long now = millis();
+    
+    if (now - lastRead >= FIREBASE_READ_INTERVAL) {
+      if (WiFi.status() == WL_CONNECTED) {
+        controlFromFirebase();
+        lastRead = now;
+      }
+    }
+    
+    if (now - lastThresholdUpdate >= THRESHOLD_UPDATE_INTERVAL) {
+      if (WiFi.status() == WL_CONNECTED) {
+        updateThresholdsFromFirebase();
+        lastThresholdUpdate = now;
+      }
+    }
+    
+    if (now - lastWrite >= FIREBASE_WRITE_INTERVAL) {
+      if (WiFi.status() == WL_CONNECTED) {
+        if (!lastAuto1State && !lastAuto2State) {
+          updateFirebaseSensorsOnly(1);
+          updateFirebaseSensorsOnly(2);
+        } else {
+          updateFirebase(1);
+          updateFirebase(2);
+        }
+        lastWrite = now;
+      }
+    }
+    
+    if ((!lastAuto1State || !lastAuto2State) && (now - lastLockLightUpdate >= LOCK_LIGHT_UPDATE_INTERVAL)) {
+      if (WiFi.status() == WL_CONNECTED) {
+        if (!lastAuto1State) {
+          Firebase.setBool(fbdo, "/kho1/lock1", digitalRead(RELAY_PIN_1) == HIGH);
+          Firebase.setBool(fbdo, "/kho1/light1", digitalRead(PIR_RELAY_PIN_1) == HIGH);
+        }
+        if (!lastAuto2State) {
+          Firebase.setBool(fbdo, "/kho2/lock2", digitalRead(RELAY_PIN_2) == HIGH);
+          Firebase.setBool(fbdo, "/kho2/light2", digitalRead(PIR_RELAY_PIN_2) == HIGH);
+        }
+        lastLockLightUpdate = now;
+      }
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+// -------------------- Main logic task --------------------
+int findChildIndex(uint8_t uid[4], int room) {
+  if (room == 1) {
+    for (int i = 0; i < childCount1; i++) {
+      if (memcmp(childUIDs1[i], uid, 4) == 0) return i;
+    }
+  } else {
+    for (int i = 0; i < childCount2; i++) {
+      if (memcmp(childUIDs2[i], uid, 4) == 0) return i;
+    }
+  }
+  return -1;
+}
+
+void handleAddCard(int room, uint8_t uid[4]) {
+  if (((room == 1 && !lastAuto1State) || (room == 2 && !lastAuto2State)) && 
+      !checkIfMaster(uid, 4, room)) {
+    postDisplayMessage("MANUAL MODE\nUse Firebase to control");
+    return;
+  }
+
+  char buf[64];
+  if (room == 1) {
+    bool exists = checkIfChildInRoom(uid, 4, 1);
+    if (!exists) {
+      if (childCount1 < MAX_CHILD_CARDS) {
+        for (int i = 0; i < 4; i++) childUIDs1[childCount1][i] = uid[i];
+        childCount1++;
+        saveChildCardsToPreferences(1);
+        snprintf(buf, sizeof(buf), "CARD ADDED P1\nTotal: %d", childCount1);
+        priorityDisplayDuration = 5000;
+        postDisplayMessage(buf);
+        beepBuzzerShort();
+      } else {
+        postDisplayMessage("CARD LIST FULL P1");
+      }
+    } else {
+      postDisplayMessage("CARD EXISTS P1");
+    }
+  } else {
+    bool exists = checkIfChildInRoom(uid, 4, 2);
+    if (!exists) {
+      if (childCount2 < MAX_CHILD_CARDS) {
+        for (int i = 0; i < 4; i++) childUIDs2[childCount2][i] = uid[i];
+        childCount2++;
+        saveChildCardsToPreferences(2);
+        snprintf(buf, sizeof(buf), "CARD ADDED P2\nTotal: %d", childCount2);
+        priorityDisplayDuration = 5000;
+        postDisplayMessage(buf);
+        beepBuzzerShort();
+      } else {
+        postDisplayMessage("CARD LIST FULL P2");
+      }
+    } else {
+      postDisplayMessage("CARD EXISTS P2");
+    }
+  }
+}
+
+void handleRemoveCard(int room, uint8_t uid[4]) {
+  if (((room == 1 && !lastAuto1State) || (room == 2 && !lastAuto2State)) && 
+      !checkIfMaster(uid, 4, room)) {
+    postDisplayMessage("MANUAL MODE\nUse Firebase to control");
+    return;
+  }
+
+  char buf[64];
+  if (room == 1) {
+    int index = findChildIndex(uid, 1);
+    if (index != -1) {
+      for (int i = index; i < childCount1 - 1; i++)
+        memcpy(childUIDs1[i], childUIDs1[i + 1], 4);
+      childCount1--;
+      saveChildCardsToPreferences(1);
+      snprintf(buf, sizeof(buf), "CARD REMOVED P1\nTotal: %d", childCount1);
+      priorityDisplayDuration = 5000;
+      postDisplayMessage(buf);
+      beepBuzzerShort();
+    } else {
+      postDisplayMessage("CARD NOT FOUND P1");
+    }
+  } else {
+    int index = findChildIndex(uid, 2);
+    if (index != -1) {
+      for (int i = index; i < childCount2 - 1; i++)
+        memcpy(childUIDs2[i], childUIDs2[i + 1], 4);
+      childCount2--;
+      saveChildCardsToPreferences(2);
+      snprintf(buf, sizeof(buf), "CARD REMOVED P2\nTotal: %d", childCount2);
+      priorityDisplayDuration = 5000;
+      postDisplayMessage(buf);
+      beepBuzzerShort();
+    } else {
+      postDisplayMessage("CARD NOT FOUND P2");
+    }
+  }
+}
+
+void checkPasswordNonBlocking(int room) {
+  if ((room == 1 && !lastAuto1State) || (room == 2 && !lastAuto2State)) {
+    postDisplayMessage("MANUAL MODE\nChild card disabled");
+    inputPassword1 = "";
+    inputPassword2 = "";
+    currentMode1 = MODE_NORMAL;
+    currentMode2 = MODE_NORMAL;
+    return;
+  }
+
+  if (room == 1) {
+    if (inputPassword1 == correctPassword1) {
+      resetFailedAttempts(1);
+      openLock(1);
+      postDisplayMessage("SUCCESS P1\nAccess granted");
+      beepBuzzerShort();
+    } else {
+      failedAttempts1++;
+      saveFailedAttempts(1);
+      char buf[64];
+      snprintf(buf, sizeof(buf), "FAIL P1\nFailed: %d/%d", failedAttempts1, MAX_FAILED_ATTEMPTS_LOCK);
+      postDisplayMessage(buf);
+      if (failedAttempts1 == MAX_FAILED_ATTEMPTS_WARNING) {
+        lastFailedSMSTime1 = millis();
+        sendSMS(ALLOWED_PHONE_1, "Canh bao: Kho P1 nhap sai mat khau 5 lan!");
+        delay(100);
+      }
+      else if (failedAttempts1 > MAX_FAILED_ATTEMPTS_WARNING && failedAttempts1 < MAX_FAILED_ATTEMPTS_LOCK) beepWarning5s();
+      else if (failedAttempts1 >= MAX_FAILED_ATTEMPTS_LOCK) {
+        sendSMS(ALLOWED_PHONE_1, "Khoa kich hoat: Kho P1 bi khoa do 10 lan that bai!");
+        delay(100);
+        childCardsLocked1 = true;
+        alarmActive1 = true;
+        lockStartTime1 = millis();
+        deleteAllChildCards(1);
+        Firebase.setBool(fbdo, "/kho1/childlock1", true);
+        Firebase.setBool(fbdo, "/kho1/alarm1", true);
+        postDisplayMessage("CHILD CARDS LOCKED P1\nSYSTEM ALERT");
+      }
+    }
+    inputPassword1 = "";
+    currentMode1 = MODE_NORMAL;
+  } else {
+    if (inputPassword2 == correctPassword2) {
+      resetFailedAttempts(2);
+      openLock(2);
+      postDisplayMessage("SUCCESS P2\nAccess granted");
+      beepBuzzerShort();
+    } else {
+      failedAttempts2++;
+      saveFailedAttempts(2);
+      char buf[64];
+      snprintf(buf, sizeof(buf), "FAIL P2\nFailed: %d/%d", failedAttempts2, MAX_FAILED_ATTEMPTS_LOCK);
+      postDisplayMessage(buf);
+      if (failedAttempts2 == MAX_FAILED_ATTEMPTS_WARNING) {
+          lastFailedSMSTime2 = millis();
+          sendSMS(ALLOWED_PHONE_2, "Canh bao: Kho P2 nhap sai mat khau 5 lan!");
+          delay(100);
+      }
+      else if (failedAttempts2 > MAX_FAILED_ATTEMPTS_WARNING && failedAttempts2 < MAX_FAILED_ATTEMPTS_LOCK) beepWarning5s();
+      else if (failedAttempts2 >= MAX_FAILED_ATTEMPTS_LOCK) {
+        sendSMS(ALLOWED_PHONE_2, "Khoa kich hoat: Kho P2 bi khoa do 10 lan that bai!");
+        delay(100);
+        childCardsLocked2 = true;
+        alarmActive2 = true;
+        lockStartTime2 = millis();
+        deleteAllChildCards(2);
+        Firebase.setBool(fbdo, "/kho2/childlock2", true);
+        Firebase.setBool(fbdo, "/kho2/alarm2", true);
+        postDisplayMessage("CHILD CARDS LOCKED P2\nSYSTEM ALERT");
+      }
+    }
+    inputPassword2 = "";
+    currentMode2 = MODE_NORMAL;
+  }
+}
+
+void TaskMainLogic(void *pvParameters) {
+  RFIDMessage rmsg;
+  char k;
+  for (;;) {
+    unsigned long now = millis();
+    
+    if (relayOnUntil1 && now >= relayOnUntil1) { 
+      digitalWrite(RELAY_PIN_1, LOW); 
+      relayOnUntil1 = 0;
+      Firebase.setBool(fbdo, "/kho1/lock1", false);
+    }
+    if (relayOnUntil2 && now >= relayOnUntil2) { 
+      digitalWrite(RELAY_PIN_2, LOW); 
+      relayOnUntil2 = 0;
+      Firebase.setBool(fbdo, "/kho2/lock2", false);
+    }
+
+    if (xQueueReceive(queueRFID, &rmsg, 0) == pdPASS) {
+      displayPriority = true; priorityDisplayTime = now;
+      beepBuzzerShort();
+      
+      if (checkIfMaster(rmsg.uid, rmsg.size, 1)) {
+        activeRoom = 1;
+        resetFailedAttempts(1);
+        isMasterMode1 = true; masterModeStartTime1 = now; currentMode1 = MODE_NORMAL;
+        postDisplayMessage("MASTER MODE P1 - 15s\nPress ****** to ADD\nPress ###### to DEL");
+        displayPriority = true;
+        priorityDisplayTime = millis();
+        priorityDisplayDuration = 15000;
+        openLock(1);
+      } else if (checkIfMaster(rmsg.uid, rmsg.size, 2)) {
+        activeRoom = 2;
+        resetFailedAttempts(2);
+        isMasterMode2 = true; masterModeStartTime2 = now; currentMode2 = MODE_NORMAL;
+        postDisplayMessage("MASTER MODE P2 - 15s\nPress ****** to ADD\nPress ###### to DEL");
+        displayPriority = true;
+        priorityDisplayTime = millis();
+        priorityDisplayDuration = 15000;
+        openLock(2);
+      } else {
+        if (isMasterMode1 && (currentMode1 == MODE_ADD_CARD || currentMode1 == MODE_REMOVE_CARD)) {
+          if (currentMode1 == MODE_ADD_CARD) handleAddCard(1, rmsg.uid);
+          else if (currentMode1 == MODE_REMOVE_CARD) handleRemoveCard(1, rmsg.uid);
+          currentMode1 = MODE_NORMAL;
+        } else if (isMasterMode2 && (currentMode2 == MODE_ADD_CARD || currentMode2 == MODE_REMOVE_CARD)) {
+          if (currentMode2 == MODE_ADD_CARD) handleAddCard(2, rmsg.uid);
+          else if (currentMode2 == MODE_REMOVE_CARD) handleRemoveCard(2, rmsg.uid);
+          currentMode2 = MODE_NORMAL;
+        } else {
+          int room = findChildCardRoom(rmsg.uid, rmsg.size);
+          if (room != 0) {
+            // KIỂM TRA CHILDLOCK TRƯỚC
+            if ((room == 1 && childCardsLocked1) || (room == 2 && childCardsLocked2)) {
+              if (room == 1) {
+                postDisplayMessage("CHILDLOCK P1 ACTIVE\nAccess denied!");
+              } else {
+                postDisplayMessage("CHILDLOCK P2 ACTIVE\nAccess denied!");
+              }
+              continue;
+            }
+            
+            // KIỂM TRA MANUAL MODE
+            if ((room == 1 && !lastAuto1State) || (room == 2 && !lastAuto2State)) {
+              if (room == 1) {
+                postDisplayMessage("MANUAL MODE P1\nChild card disabled");
+              } else {
+                postDisplayMessage("MANUAL MODE P2\nChild card disabled");
+              }
+              continue;
+            }
+            
+            // Nếu qua được 2 check trên thì mới cho nhập mật khẩu
+            activeRoom = room;
+            if (room == 1) {
+              currentMode1 = MODE_PASSWORD_INPUT; inputPassword1 = "";
+              postDisplayMessage("CHILD CARD P1\nEnter Password:");
+            } else {
+              currentMode2 = MODE_PASSWORD_INPUT; inputPassword2 = "";
+              postDisplayMessage("CHILD CARD P2\nEnter Password:");
+            }
+          } else {
+            char buf[48];
+            snprintf(buf, sizeof(buf), "ACCESS DENIED\nUNKNOWN CARD");
+            postDisplayMessage(buf);
+          }
+        }
+      }
+    }
+
+    if (xQueueReceive(queueKeypad, &k, 0) == pdPASS) {
+      displayPriority = true; priorityDisplayTime = now;
+      
+      static String masterCommand1 = "";
+      static String masterCommand2 = "";
+
+      if ((isMasterMode1 && (currentMode1 == MODE_ADD_CARD || currentMode1 == MODE_REMOVE_CARD)) ||
+          (isMasterMode2 && (currentMode2 == MODE_ADD_CARD || currentMode2 == MODE_REMOVE_CARD))) {
+        continue;
+      }
+
+      if (isMasterMode1 && currentMode1 == MODE_NORMAL) {
+        if (k == '*' || k == '#') {
+          masterCommand1 += k;
+          char buf[64];
+          snprintf(buf, sizeof(buf), "MASTER MODE P1\nCommand: %s", masterCommand1.c_str());
+          postDisplayMessage(buf);
+          if (masterCommand1 == "******") {
+            currentMode1 = MODE_ADD_CARD; masterModeStartTime1 = now; masterCommand1 = "";
+            postDisplayMessage("ADD CARD P1\nScan new card...");
+          } else if (masterCommand1 == "######") {
+            currentMode1 = MODE_REMOVE_CARD; masterModeStartTime1 = now; masterCommand1 = "";
+            postDisplayMessage("REMOVE CARD P1\nScan card to delete");
+          } else if (masterCommand1.length() == 6 && masterCommand1 != "******" && masterCommand1 != "######") {
+            postDisplayMessage("WRONG COMMAND!\nExit Master Mode");
+            beepBuzzerShort();
+            isMasterMode1 = false; currentMode1 = MODE_NORMAL; digitalWrite(RELAY_PIN_1, LOW);
+            masterCommand1 = "";
+          }
+        }
+        continue;
+      }
+      if (isMasterMode2 && currentMode2 == MODE_NORMAL) {
+        if (k == '*' || k == '#') {
+          masterCommand2 += k;
+          char buf[64];
+          snprintf(buf, sizeof(buf), "MASTER MODE P2\nCommand: %s", masterCommand2.c_str());
+          postDisplayMessage(buf);
+          if (masterCommand2 == "******") {
+            currentMode2 = MODE_ADD_CARD; masterModeStartTime2 = now; masterCommand2 = "";
+            postDisplayMessage("ADD CARD P2\nScan new card...");
+          } else if (masterCommand2 == "######") {
+            currentMode2 = MODE_REMOVE_CARD; masterModeStartTime2 = now; masterCommand2 = "";
+            postDisplayMessage("REMOVE CARD P2\nScan card to delete");
+          } else if (masterCommand2.length() == 6 && masterCommand2 != "******" && masterCommand2 != "######") {
+            postDisplayMessage("WRONG COMMAND!\nExit Master Mode");
+            beepBuzzerShort();
+            isMasterMode2 = false; currentMode2 = MODE_NORMAL; digitalWrite(RELAY_PIN_2, LOW);
+            masterCommand2 = "";
+          }
+        }
+        continue;
+      }
+
+      int room = activeRoom ? activeRoom : 1;
+      if (room == 1) {
+        if (currentMode1 == MODE_PASSWORD_INPUT) {
+          if (k == '#') {
+            checkPasswordNonBlocking(1);
+          } else if (k == '*') {
+            if (inputPassword1.length() > 0) {
+              inputPassword1.remove(inputPassword1.length() - 1);
+              String displayStars = "";
+              for (int i = 0; i < inputPassword1.length(); i++) {
+                displayStars += '*';
+              }
+              for (int i = inputPassword1.length(); i < PASSWORD_LENGTH; i++) {
+                displayStars += ' ';
+              }
+              postDisplayMessage(("CHILD CARD P1\nEnter Password:\n" + displayStars).c_str());
+            } else {
+              postDisplayMessage("CHILD CARD P1\nEnter Password:\n      ");
+            }
+          } else if (k >= '0' && k <= '9') {
+            if (inputPassword1.length() < PASSWORD_LENGTH) {
+              inputPassword1 += k;
+              String displayStars = "";
+              for (int i = 0; i < inputPassword1.length(); i++) {
+                displayStars += '*';
+              }
+              for (int i = inputPassword1.length(); i < PASSWORD_LENGTH; i++) {
+                displayStars += ' ';
+              }
+              postDisplayMessage(("CHILD CARD P1\nEnter Password:\n" + displayStars).c_str());
+              if (inputPassword1.length() == PASSWORD_LENGTH) checkPasswordNonBlocking(1);
+            }
+          }
+        }
+      } else {
+        if (currentMode2 == MODE_PASSWORD_INPUT) {
+          if (k == '#') {
+            checkPasswordNonBlocking(2);
+          } else if (k == '*') {
+            if (inputPassword2.length() > 0) {
+              inputPassword2.remove(inputPassword2.length() - 1);
+              String displayStars = "";
+              for (int i = 0; i < inputPassword2.length(); i++) {
+                displayStars += '*';
+              }
+              for (int i = inputPassword2.length(); i < PASSWORD_LENGTH; i++) {
+                displayStars += ' ';
+              }
+              postDisplayMessage(("CHILD CARD P2\nEnter Password:\n" + displayStars).c_str());
+            } else {
+              postDisplayMessage("CHILD CARD P2\nEnter Password:\n      ");
+            }
+          } else if (k >= '0' && k <= '9') {
+            if (inputPassword2.length() < PASSWORD_LENGTH) {
+              inputPassword2 += k;
+              String displayStars = "";
+              for (int i = 0; i < inputPassword2.length(); i++) {
+                displayStars += '*';
+              }
+              for (int i = inputPassword2.length(); i < PASSWORD_LENGTH; i++) {
+                displayStars += ' ';
+              }
+              postDisplayMessage(("CHILD CARD P2\nEnter Password:\n" + displayStars).c_str());
+              if (inputPassword2.length() == PASSWORD_LENGTH) checkPasswordNonBlocking(2);
+            }
+          }
+        }
+      }
+    }
+
+    if (isMasterMode1 && currentMode1 == MODE_NORMAL && (now - masterModeStartTime1 > MASTER_MODE_DURATION)) {
+      isMasterMode1 = false; currentMode1 = MODE_NORMAL; digitalWrite(RELAY_PIN_1, LOW);
+      postDisplayMessage("MASTER MODE P1\nTimeout");
+      displayPriority = true;
+      priorityDisplayTime = millis();
+      priorityDisplayDuration = 2000;
+    }
+    if (isMasterMode2 && currentMode2 == MODE_NORMAL && (now - masterModeStartTime2 > MASTER_MODE_DURATION)) {
+      isMasterMode2 = false; currentMode2 = MODE_NORMAL; digitalWrite(RELAY_PIN_2, LOW);
+      postDisplayMessage("MASTER MODE P2\nTimeout");
+      displayPriority = true;
+      priorityDisplayTime = millis();
+      priorityDisplayDuration = 2000;
+    }
+
+    if ((currentMode1 == MODE_ADD_CARD || currentMode1 == MODE_REMOVE_CARD) && (now - masterModeStartTime1 > OPERATION_DURATION)) {
+      currentMode1 = MODE_NORMAL; isMasterMode1 = false; digitalWrite(RELAY_PIN_1, LOW); postDisplayMessage("OPERATION P1\nTimeout");
+    }
+    if ((currentMode2 == MODE_ADD_CARD || currentMode2 == MODE_REMOVE_CARD) && (now - masterModeStartTime2 > OPERATION_DURATION)) {
+      currentMode2 = MODE_NORMAL; isMasterMode2 = false; digitalWrite(RELAY_PIN_2, LOW); postDisplayMessage("OPERATION P2\nTimeout");
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+
+// -------------------- Setup --------------------
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  connectWiFi();
+  initFirebase();
+  delay(1500);
+
+  if (Firebase.getString(fbdo, "/kho1/phone1")) {
+    ALLOWED_PHONE_1 = fbdo.stringData();
+    Serial.println("Initial phone1: " + ALLOWED_PHONE_1);
+  }
+  if (Firebase.getString(fbdo, "/kho2/phone2")) {
+    ALLOWED_PHONE_2 = fbdo.stringData();
+    Serial.println("Initial phone2: " + ALLOWED_PHONE_2);
+  }
+
+  if (Firebase.getString(fbdo, "/kho1/pass1")) {
+    String newPass1 = fbdo.stringData();
+    if (newPass1.length() == 6) {
+      correctPassword1 = newPass1;
+      Serial.println("Initial password1: " + correctPassword1);
+    } else {
+      Firebase.setString(fbdo, "/kho1/pass1", correctPassword1);
+      Serial.println("Invalid initial password1, set to default: " + correctPassword1);
+    }
+  }
+
+  if (Firebase.getString(fbdo, "/kho2/pass2")) {
+    String newPass2 = fbdo.stringData();
+    if (newPass2.length() == 6) {
+      correctPassword2 = newPass2;
+      Serial.println("Initial password2: " + correctPassword2);
+    } else {
+      Firebase.setString(fbdo, "/kho2/pass2", correctPassword2);
+      Serial.println("Invalid initial password2, set to default: " + correctPassword2);
+    }
+  }
+
+  pref1.begin("smart-lock1", false);
+  pref2.begin("smart-lock2", false);
+
+  displayMutex = xSemaphoreCreateMutex();
+  prefsMutex = xSemaphoreCreateMutex();
+  queueRFID = xQueueCreate(8, sizeof(RFIDMessage));
+  queueKeypad = xQueueCreate(16, sizeof(char));
+  queueDisplayIndex = xQueueCreate(8, sizeof(int));
+
+  failedAttempts1 = pref1.getInt("failedAttempts", 0);
+  if (failedAttempts1 >= MAX_FAILED_ATTEMPTS_LOCK) { childCardsLocked1 = true; childCount1 = 0; }
+  else loadChildCardsFromPreferences(1);
+
+  failedAttempts2 = pref2.getInt("failedAttempts", 0);
+  if (failedAttempts2 >= MAX_FAILED_ATTEMPTS_LOCK) { childCardsLocked2 = true; childCount2 = 0; }
+  else loadChildCardsFromPreferences(2);
+
+  Wire.begin(OLED_SDA, OLED_SCL);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    for (;;);
+  }
+
+  for (byte r = 0; r < ROWS; r++) pinMode(rowPins[r], INPUT_PULLUP);
+  for (byte c = 0; c < COLS; c++) { pinMode(colPins[c], OUTPUT); digitalWrite(colPins[c], HIGH); }
+
+  SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
+  mfrc522.PCD_Init();
+
+  pinMode(RELAY_PIN_1, OUTPUT); pinMode(RELAY_PIN_2, OUTPUT);
+  pinMode(PIR_RELAY_PIN_1, OUTPUT); pinMode(PIR_RELAY_PIN_2, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(EMERGENCY_BUTTON_PIN_1, INPUT_PULLUP);
+  pinMode(EMERGENCY_BUTTON_PIN_2, INPUT_PULLUP);
+  digitalWrite(RELAY_PIN_1, LOW); digitalWrite(RELAY_PIN_2, LOW);
+  digitalWrite(PIR_RELAY_PIN_1, LOW); digitalWrite(PIR_RELAY_PIN_2, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+  pinMode(PIR_PIN_1, INPUT); pinMode(PIR_PIN_2, INPUT);
+
+  moduleSim.begin(115200, SERIAL_8N1, RX_PIN, TX_PIN);
+  delay(2000);
+  moduleSim.println("AT"); delay(100);
+  moduleSim.println("ATE0"); delay(50);
+  moduleSim.println("AT+CMGF=1"); delay(50);
+  moduleSim.println("AT+CNMI=2,2,0,0,0"); delay(50);
+
+  pinMode(DHT_PIN_1, INPUT_PULLUP); pinMode(DHT_PIN_2, INPUT_PULLUP);
+  dht1.begin(); dht2.begin();
+
+  pinMode(LED_PIN, OUTPUT); digitalWrite(LED_PIN, LOW);
+  analogReadResolution(12);
+
+  // ========= KHỞI TẠO CACHE DHT =========
+  delay(2000); // Chờ DHT khởi động
+  
+  // Đọc giá trị ban đầu cho cache
+  cachedTemp1 = dht1.readTemperature();
+  cachedHum1 = dht1.readHumidity();
+  delay(50);
+  cachedTemp2 = dht2.readTemperature();
+  cachedHum2 = dht2.readHumidity();
+  
+  // Kiểm tra và set valid flag (CHỈ CHECK NAN)
+  dhtCacheValid1 = (!isnan(cachedTemp1) && !isnan(cachedHum1));
+  dhtCacheValid2 = (!isnan(cachedTemp2) && !isnan(cachedHum2));
+  // =====================================
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0,0);
+  display.println("RFID + Envi + PIR");
+  display.setCursor(0,10);
+  display.println("System Starting...");
+  display.setCursor(0,20);
+  display.print("Cards1:"); display.print(childCount1);
+  display.print(" Cards2:"); display.print(childCount2);
+  display.display();
+
+  if (childCardsLocked1) { postDisplayMessage("CHILD CARDS LOCKED P1"); for (int i=0;i<3;i++){ tone(BUZZER_PIN, 1000, 300); delay(300); } }
+  if (childCardsLocked2) { postDisplayMessage("CHILD CARDS LOCKED P2"); for (int i=0;i<3;i++){ tone(BUZZER_PIN, 1000, 300); delay(300); } }
+  if (!childCardsLocked1 && !childCardsLocked2) tone(BUZZER_PIN, 1000, 200);
+
+  xTaskCreate(TaskMainLogic, "TaskMain", 8192, NULL, 6, NULL);         // CAO: 
+  xTaskCreate(TaskRFID, "TaskRFID", 4096, NULL, 5, NULL);              // TRUNG BÌNH CAO
+  xTaskCreate(TaskSensors, "TaskSensors", 4096, NULL, 4, NULL);        // TRUNG BÌNH 
+  xTaskCreate(TaskKeypad, "TaskKeypad", 3072, NULL, 4, NULL);          // TRUNG BÌNH
+  xTaskCreate(TaskSMS, "TaskSMS", 8192, NULL, 3, NULL);                // ƯU TIÊN SMS HƠN
+  xTaskCreate(TaskFirebase, "TaskFirebase", 8192, NULL, 2, NULL);      // THẤP
+  xTaskCreate(TaskDisplay, "TaskDisplay", 4096, NULL, 1, NULL);        // THẤP NHẤT
+
+  for (int i=0;i<DISPLAY_POOL_SIZE;i++) displayPool[i][0]=0;
+  delay(1500);
+}
+
+void loop() {
+  vTaskDelay(pdMS_TO_TICKS(1000));
+}
+
+
