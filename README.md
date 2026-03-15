@@ -1,5 +1,3 @@
-# food-storage-environment-monitoring-system
-ESP32-based environmental monitoring system with Flutter mobile applications
 # Food Storage Environmental Monitoring System
 
 This project is an environmental monitoring system designed for food storage environments. The system monitors temperature and humidity using environmental sensors and an ESP32 microcontroller.
